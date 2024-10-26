@@ -1,7 +1,8 @@
 #test end to end benchmark data test
 import sys, os
-import torch
+from pathlib import Path
 import argparse
+import torch
 import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
@@ -11,7 +12,7 @@ import cv2
 from torch.autograd import Variable
 from torch.utils import data
 from tqdm import tqdm
-import matplotlib.pyplot as plt
+# import matplotlib.pyplot as plt
 
 
 from models import get_model
@@ -43,11 +44,16 @@ def unwarp(img, bm):
     return res
 
 
-def test(args,img_path,fname):
-    wc_model_file_name = os.path.split(args.wc_model_path)[1]
+def test(
+    wc_model_path,
+    bm_model_path,
+    img_path,
+    out_path
+):
+    wc_model_file_name = os.path.split(wc_model_path)[1]
     wc_model_name = wc_model_file_name[:wc_model_file_name.find('_')]
 
-    bm_model_file_name = os.path.split(args.bm_model_path)[1]
+    bm_model_file_name = os.path.split(bm_model_path)[1]
     bm_model_name = bm_model_file_name[:bm_model_file_name.find('_')]
 
     wc_n_classes = 3
@@ -61,16 +67,16 @@ def test(args,img_path,fname):
     imgorg = cv2.imread(img_path)
     imgorg = cv2.cvtColor(imgorg, cv2.COLOR_BGR2RGB)
     img = cv2.resize(imgorg, wc_img_size)
-    
+
     '''
-    # Alternatively use scipy (< v1.2.0) 
+    # Alternatively use scipy (< v1.2.0)
     # TO PRODUCE THE RESULTS REPORTED IN THE PAPER
     # Comment line 61-63 and uncomment 68-69
-    # For details refer to https://github.com/cvlab-stonybrook/DewarpNet/issues/38 
+    # For details refer to https://github.com/cvlab-stonybrook/DewarpNet/issues/38
     imgorg = m.imread(img_path,mode='RGB')
     img = m.imresize(imgorg, wc_loaderimg_size)
     '''
-    
+
     img = img[:, :, ::-1]
     img = img.astype(float) / 255.0
     img = img.transpose(2, 0, 1) # NHWC -> NCHW
@@ -81,16 +87,16 @@ def test(args,img_path,fname):
     htan = nn.Hardtanh(0,1.0)
     wc_model = get_model(wc_model_name, wc_n_classes, in_channels=3)
     if DEVICE.type == 'cpu':
-        wc_state = convert_state_dict(torch.load(args.wc_model_path, map_location='cpu')['model_state'])
+        wc_state = convert_state_dict(torch.load(wc_model_path, map_location='cpu')['model_state'])
     else:
-        wc_state = convert_state_dict(torch.load(args.wc_model_path)['model_state'])
+        wc_state = convert_state_dict(torch.load(wc_model_path)['model_state'])
     wc_model.load_state_dict(wc_state)
     wc_model.eval()
     bm_model = get_model(bm_model_name, bm_n_classes, in_channels=3)
     if DEVICE.type == 'cpu':
-        bm_state = convert_state_dict(torch.load(args.bm_model_path, map_location='cpu')['model_state'])
+        bm_state = convert_state_dict(torch.load(bm_model_path, map_location='cpu')['model_state'])
     else:
-        bm_state = convert_state_dict(torch.load(args.bm_model_path)['model_state'])
+        bm_state = convert_state_dict(torch.load(bm_model_path)['model_state'])
     bm_model.load_state_dict(bm_state)
     bm_model.eval()
 
@@ -110,34 +116,20 @@ def test(args,img_path,fname):
     # call unwarp
     uwpred=unwarp(imgorg, outputs_bm)
 
-    if args.show:
-        f1, axarr1 = plt.subplots(1, 2)
-        axarr1[0].imshow(imgorg)
-        axarr1[1].imshow(uwpred)
-        plt.show()
-
     # Save the output
-    outp=os.path.join(args.out_path,fname)
-    cv2.imwrite(outp,uwpred[:,:,::-1]*255)
+    cv2.imwrite(out_path, uwpred[:,:,::-1]*255)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Params')
-    parser.add_argument('--wc_model_path', nargs='?', type=str, default='',
-                        help='Path to the saved wc model')
-    parser.add_argument('--bm_model_path', nargs='?', type=str, default='',
-                        help='Path to the saved bm model')
     parser.add_argument('--img_path', nargs='?', type=str, default='./eval/inp/',
                         help='Path of the input image')
     parser.add_argument('--out_path', nargs='?', type=str, default='./eval/uw/',
                         help='Path of the output unwarped image')
-    parser.add_argument('--show', dest='show', action='store_true',
-                        help='Show the input image and output unwarped')
-    parser.set_defaults(show=False)
     args = parser.parse_args()
-    for fname in os.listdir(args.img_path):
-        if '.jpg' in fname or '.JPG' in fname or '.png' in fname:
-            img_path=os.path.join( args.img_path,fname)
-            test(args,img_path,fname)
 
-
-# python infer.py --wc_model_path ./eval/models/unetnc_doc3d.pkl --bm_model_path ./eval/models/dnetccnl_doc3d.pkl --show
+    test(
+        wc_model_path='./eval/models/unetnc_doc3d.pkl',
+        bm_model_path='./eval/models/dnetccnl_doc3d.pkl',
+        img_path=args.img_path,
+        out_path=args.out_path,
+    )
