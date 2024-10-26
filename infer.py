@@ -1,135 +1,184 @@
-#test end to end benchmark data test
-import sys, os
-from pathlib import Path
-import argparse
+import os
+import logging
+from typing import Optional
+
 import torch
-import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
-import torchvision.models as models
-import cv2
-#import scipy.misc as m ## USE scipy (< v1.2.0) TO READ THE IMAGE TO PRODUCE THE RESULTS REPORTED IN THE PAPER
-from torch.autograd import Variable
-from torch.utils import data
-from tqdm import tqdm
-# import matplotlib.pyplot as plt
-
+from PIL import Image
+import numpy as np
+from scipy.ndimage import gaussian_filter
+import torchvision.transforms as transforms
 
 from models import get_model
-from loaders import get_loader
 from utils import convert_state_dict
 
-DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
-def unwarp(img, bm):
-    w,h=img.shape[0],img.shape[1]
-    bm = bm.transpose(1, 2).transpose(2, 3).detach().cpu().numpy()[0,:,:,:]
-    bm0=cv2.blur(bm[:,:,0],(3,3))
-    bm1=cv2.blur(bm[:,:,1],(3,3))
-    bm0=cv2.resize(bm0,(h,w))
-    bm1=cv2.resize(bm1,(h,w))
-    bm=np.stack([bm0,bm1],axis=-1)
-    bm=np.expand_dims(bm,0)
-    bm=torch.from_numpy(bm).double()
+class DewarpNetPredictor:
+    def __init__(
+        self,
+        wc_model_path: str = './eval/models/unetnc_doc3d.pkl',
+        bm_model_path: str = './eval/models/dnetccnl_doc3d.pkl',
+        device: Optional[torch.device] = None,
+    ):
+        """
+        Initializes the DewarpNet predictor by loading the models.
 
-    img = img.astype(float) / 255.0
-    img = img.transpose((2, 0, 1))
-    img = np.expand_dims(img, 0)
-    img = torch.from_numpy(img).double()
+        Args:
+            wc_model_path (str, optional): Path to the wireframe correction (wc) model.
+                                           Defaults to './eval/models/unetnc_doc3d.pkl'.
+            bm_model_path (str, optional): Path to the basis matrix (bm) model.
+                                           Defaults to './eval/models/dnetccnl_doc3d.pkl'.
+            device (torch.device, optional): Device to run the models on. Defaults to GPU if available.
+        """
+        self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.wc_model = self._load_model(wc_model_path, model_type='wc')
+        self.bm_model = self._load_model(bm_model_path, model_type='bm')
+        self.htan = nn.Hardtanh(0, 1.0)
+        self.wc_img_size = (256, 256)
+        self.bm_img_size = (128, 128)
+        self.transform = transforms.Compose([
+            transforms.Resize(self.wc_img_size),
+            transforms.ToTensor(),
+        ])
+        logger.info("Models loaded and predictor initialized.")
 
-    res = F.grid_sample(input=img, grid=bm)
-    res = res[0].numpy().transpose((1, 2, 0))
+    def _load_model(self, model_path: str, model_type: str) -> nn.Module:
+        """
+        Loads a model from the given path.
 
-    return res
+        Args:
+            model_path (str): Path to the model file.
+            model_type (str): Type of the model ('wc' or 'bm').
 
+        Returns:
+            nn.Module: The loaded model.
+        """
+        if not os.path.exists(model_path):
+            logger.error(f"Model file not found: {model_path}")
+            raise FileNotFoundError(f"Model file not found: {model_path}")
 
-def test(
-    wc_model_path,
-    bm_model_path,
-    img_path,
-    out_path
-):
-    wc_model_file_name = os.path.split(wc_model_path)[1]
-    wc_model_name = wc_model_file_name[:wc_model_file_name.find('_')]
+        model_file_name = os.path.basename(model_path)
+        model_name = model_file_name.split('_')[0]
 
-    bm_model_file_name = os.path.split(bm_model_path)[1]
-    bm_model_name = bm_model_file_name[:bm_model_file_name.find('_')]
+        n_classes = 3 if model_type == 'wc' else 2
+        model = get_model(model_name, n_classes, in_channels=3)
 
-    wc_n_classes = 3
-    bm_n_classes = 2
+        try:
+            if self.device.type == 'cpu':
+                state = convert_state_dict(
+                    torch.load(model_path, map_location='cpu')['model_state']
+                )
+            else:
+                state = convert_state_dict(
+                    torch.load(model_path)['model_state']
+                )
+            model.load_state_dict(state)
+            model.to(self.device)
+            model.eval()
+            logger.info(f"{model_type.upper()} model loaded successfully.")
+            return model
+        except Exception as e:
+            logger.exception(f"Failed to load {model_type.upper()} model.")
+            raise e
 
-    wc_img_size=(256,256)
-    bm_img_size=(128,128)
+    def predict(self, image: Image.Image) -> np.ndarray:
+        """
+        Performs dewarping prediction on the given image.
 
-    # Setup image
-    print("Read Input Image from : {}".format(img_path))
-    imgorg = cv2.imread(img_path)
-    imgorg = cv2.cvtColor(imgorg, cv2.COLOR_BGR2RGB)
-    img = cv2.resize(imgorg, wc_img_size)
+        Args:
+            image (PIL.Image.Image): The input image.
 
-    '''
-    # Alternatively use scipy (< v1.2.0)
-    # TO PRODUCE THE RESULTS REPORTED IN THE PAPER
-    # Comment line 61-63 and uncomment 68-69
-    # For details refer to https://github.com/cvlab-stonybrook/DewarpNet/issues/38
-    imgorg = m.imread(img_path,mode='RGB')
-    img = m.imresize(imgorg, wc_loaderimg_size)
-    '''
+        Returns:
+            np.ndarray: The dewarped image as a NumPy array.
+        """
+        try:
+            # Preprocess the image
+            img = self.transform(image).unsqueeze(0).to(self.device)
 
-    img = img[:, :, ::-1]
-    img = img.astype(float) / 255.0
-    img = img.transpose(2, 0, 1) # NHWC -> NCHW
-    img = np.expand_dims(img, 0)
-    img = torch.from_numpy(img).float()
+            # Wireframe Correction Model Prediction
+            with torch.no_grad():
+                wc_output = self.wc_model(img)
+                pred_wc = self.htan(wc_output)
 
-    # Predict
-    htan = nn.Hardtanh(0,1.0)
-    wc_model = get_model(wc_model_name, wc_n_classes, in_channels=3)
-    if DEVICE.type == 'cpu':
-        wc_state = convert_state_dict(torch.load(wc_model_path, map_location='cpu')['model_state'])
-    else:
-        wc_state = convert_state_dict(torch.load(wc_model_path)['model_state'])
-    wc_model.load_state_dict(wc_state)
-    wc_model.eval()
-    bm_model = get_model(bm_model_name, bm_n_classes, in_channels=3)
-    if DEVICE.type == 'cpu':
-        bm_state = convert_state_dict(torch.load(bm_model_path, map_location='cpu')['model_state'])
-    else:
-        bm_state = convert_state_dict(torch.load(bm_model_path)['model_state'])
-    bm_model.load_state_dict(bm_state)
-    bm_model.eval()
+            # Prepare input for Basis Matrix Model
+            bm_input = F.interpolate(pred_wc, size=self.bm_img_size, mode='bilinear', align_corners=False)
 
-    if torch.cuda.is_available():
-        wc_model.cuda()
-        bm_model.cuda()
-        images = Variable(img.cuda())
-    else:
-        images = Variable(img)
+            # Basis Matrix Model Prediction
+            with torch.no_grad():
+                bm_output = self.bm_model(bm_input)
 
-    with torch.no_grad():
-        wc_outputs = wc_model(images)
-        pred_wc = htan(wc_outputs)
-        bm_input=F.interpolate(pred_wc, bm_img_size)
-        outputs_bm = bm_model(bm_input)
+            # Unwarp the image
+            dewarped_image = self._unwarp(image, bm_output)
+            logger.info("Prediction completed successfully.")
+            return dewarped_image
+        except Exception as e:
+            logger.exception("Prediction failed.")
+            raise e
 
-    # call unwarp
-    uwpred=unwarp(imgorg, outputs_bm)
+    def _unwarp(self, img: Image.Image, bm: torch.Tensor) -> np.ndarray:
+        """
+        Applies the unwarping transformation to the image using the predicted basis matrix.
 
-    # Save the output
-    cv2.imwrite(out_path, uwpred[:,:,::-1]*255)
+        Args:
+            img (PIL.Image.Image): The original image.
+            bm (torch.Tensor): The predicted basis matrix from the model.
 
+        Returns:
+            np.ndarray: The dewarped image as a NumPy array.
+        """
+        # Convert image to NumPy array
+        img_np = np.array(img).astype(np.float32) / 255.0
+        h, w = img_np.shape[:2]
+
+        # Process basis matrix
+        bm_np = bm.permute(0, 2, 3, 1).squeeze(0).detach().cpu().numpy()
+        bm0 = gaussian_filter(bm_np[:, :, 0], sigma=1)
+        bm1 = gaussian_filter(bm_np[:, :, 1], sigma=1)
+
+        # Resize basis matrices to match image dimensions
+        bm0_resized = np.array(Image.fromarray(bm0).resize((w, h), Image.BILINEAR))
+        bm1_resized = np.array(Image.fromarray(bm1).resize((w, h), Image.BILINEAR))
+
+        # Stack and prepare grid for sampling
+        bm_resized = np.stack([bm0_resized, bm1_resized], axis=-1)
+        bm_tensor = torch.from_numpy(bm_resized).unsqueeze(0).double().to(self.device)
+
+        # Prepare image tensor
+        img_tensor = torch.from_numpy(img_np.transpose(2, 0, 1)).unsqueeze(0).double().to(self.device)
+
+        # Grid sampling
+        with torch.no_grad():
+            resampled = F.grid_sample(
+                img_tensor,
+                bm_tensor,
+                mode='bilinear',
+                padding_mode='border',
+                align_corners=False
+            )
+
+        # Convert back to NumPy array
+        dewarped_img = resampled.squeeze(0).cpu().numpy().transpose(1, 2, 0)
+        dewarped_img = (dewarped_img * 255).astype(np.uint8)
+        return dewarped_img
+
+# Example usage:
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Params')
-    parser.add_argument('--img_path', nargs='?', type=str, default='./eval/inp/',
-                        help='Path of the input image')
-    parser.add_argument('--out_path', nargs='?', type=str, default='./eval/uw/',
-                        help='Path of the output unwarped image')
-    args = parser.parse_args()
+    # Initialize the predictor with default model paths
+    predictor = DewarpNetPredictor()
 
-    test(
-        wc_model_path='./eval/models/unetnc_doc3d.pkl',
-        bm_model_path='./eval/models/dnetccnl_doc3d.pkl',
-        img_path=args.img_path,
-        out_path=args.out_path,
-    )
+    # Load the input image (replace 'path/to/input/image.jpg' with your image path)
+    input_image_path = 'eval/inp/4_2.png'
+    input_image = Image.open(input_image_path).convert('RGB')
+
+    # Perform prediction
+    dewarped_image = predictor.predict(input_image)
+
+    # Save the output image (replace 'path/to/output/image.jpg' with your desired output path)
+    output_image_path = '4_2.png'
+    Image.fromarray(dewarped_image).save(output_image_path)
+    logger.info(f"Dewarped image saved to: {output_image_path}")

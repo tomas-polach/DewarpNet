@@ -10,7 +10,7 @@ pip install -r requirements.txt
 
 copy dnetccnl_doc3d.pkl and unetnc_doc3d.pkl to eval/models
 
-python infer.py --img_path=./eval/inp/4_2.png --out_path=4_2.png
+python infer.py
 ```
 
 # DewarpNet
